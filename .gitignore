@@ -1,0 +1,32 @@
+# IDE
+.DS_Store
+*.swp
+*.swo
+*.suo
+*.ncb
+*.db
+*.user
+*.tlog
+*.obj
+*.o
+*.ilk
+*.pdb
+*.idb
+*~
+*~.xml
+.sass-cache/
+
+# build artifacts
+obj/
+ipch/
+build/
+bin/
+Debug/
+Release/
+*.app
+*.exec
+*.log
+
+# OF specific
+example/bin/.gitkeep
+example/bin/data/.gitkeep
