@@ -1,0 +1,176 @@
+void PhaseCongruency::setConst(PhaseCongruencyConst _pcc)
+{
+    pcc = _pcc;
+}
+
+//Phase congruency calculation
+void PhaseCongruency::calc(InputArray _src, std::vector<cv::Mat> &_pc)
+{
+    Mat src = _src.getMat();
+
+    CV_Assert(src.size() == size);
+
+    const int width = size.width, height = size.height;
+
+    Mat src64;
+    src.convertTo(src64, MAT_TYPE_CNV, 1.0 / 255.0);
+
+    const int dft_M_r = getOptimalDFTSize(src.rows) - src.rows;
+    const int dft_N_c = getOptimalDFTSize(src.cols) - src.cols;
+
+    _pc.resize(norient);
+    std::vector<Mat> eo(nscale);
+    Mat complex[2];
+    Mat sumAn;
+    Mat sumRe;
+    Mat sumIm;
+    Mat maxAn;
+    Mat xEnergy;
+    Mat tmp;
+    Mat tmp1;
+    Mat tmp2;
+    Mat energy = Mat::zeros(size, MAT_TYPE);
+
+    //expand input image to optimal size
+    Mat padded;
+    copyMakeBorder(src64, padded, 0, dft_M_r, 0, dft_N_c, BORDER_CONSTANT, Scalar::all(0));
+    Mat planes[] = { Mat_<double>(padded), Mat::zeros(padded.size(), MAT_TYPE_CNV) };
+
+    Mat dft_A;
+    merge(planes, 2, dft_A);         // Add to the expanded another plane with zeros
+    dft(dft_A, dft_A);            // this way the result may fit in the source matrix
+
+    shiftDFT(dft_A, dft_A);
+
+    for (unsigned o = 0; o < norient; o++)
+    {
+        double noise = 0;
+        for (unsigned scale = 0; scale < nscale; scale++)
+        {
+            Mat filtered;
+            mulSpectrums(dft_A, filter[nscale * o + scale], filtered, 0); // Convolution
+            dft(filtered, filtered, DFT_INVERSE);
+            filtered(cv::Rect(0, 0, width, height)).copyTo(eo[scale]);
+
+            split(eo[scale], complex);
+            Mat eo_mag;
+            magnitude(complex[0], complex[1], eo_mag);
+
+            if (scale == 0)
+            {
+                //here to do noise threshold calculation
+                auto tau = mean(eo_mag);
+                tau.val[0] = tau.val[0] / sqrt(log(4.0));
+                auto mt = 1.0 * pow(pcc.mult, nscale);
+                auto totalTau = tau.val[0] * (1.0 - 1.0 / mt) / (1.0 - 1.0 / pcc.mult);
+                auto m = totalTau * sqrt(M_PI / 2.0);
+                auto n = totalTau * sqrt((4 - M_PI) / 2.0);
+                noise = m + pcc.k * n;
+
+                eo_mag.copyTo(maxAn);
+                eo_mag.copyTo(sumAn);
+                complex[0].copyTo(sumRe);
+                complex[1].copyTo(sumIm);
+            }
+            else
+            {
+                add(sumAn, eo_mag, sumAn);
+                max(eo_mag, maxAn, maxAn);
+                add(sumRe, complex[0], sumRe);
+                add(sumIm, complex[1], sumIm);
+            }
+        } // next scale
+
+        magnitude(sumRe, sumIm, xEnergy);
+        xEnergy += pcc.epsilon;
+        divide(sumIm, xEnergy, sumIm);
+        divide(sumRe, xEnergy, sumRe);
+        energy.setTo(0);
+        for (int scale = 0; scale < nscale; scale++)
+        {
+            split(eo[scale], complex);
+
+            multiply(complex[0], sumIm, tmp1);
+            multiply(complex[1], sumRe, tmp2);
+
+            absdiff(tmp1, tmp2, tmp);
+            subtract(energy, tmp, energy);
+
+            multiply(complex[0], sumRe, complex[0]);
+            add(energy, complex[0], energy);
+            multiply(complex[1], sumIm, complex[1]);
+            add(energy, complex[1], energy);
+        } //next scale
+
+        energy -= Scalar::all(noise); // -noise
+        max(energy, 0.0, energy);
+        maxAn += pcc.epsilon;
+
+        divide(sumAn, maxAn, tmp, -1.0 / static_cast<double>(nscale));
+
+        tmp += pcc.cutOff;
+        tmp = tmp * pcc.g;
+        exp(tmp, tmp);
+        tmp += 1.0; // 1 / weight
+
+        //PC
+        multiply(tmp, sumAn, tmp);
+        divide(energy, tmp, _pc[o]);
+    }//orientation
+}
+
+//Build up covariance data for every point
+void PhaseCongruency::feature(std::vector<cv::Mat>& _pc, cv::OutputArray _edges, cv::OutputArray _corners)
+{
+    _edges.create(size, CV_8UC1);
+    _corners.create(size, CV_8UC1);
+    auto edges = _edges.getMat();
+    auto corners = _corners.getMat();
+
+    Mat covx2 = Mat::zeros(size, MAT_TYPE);
+    Mat covy2 = Mat::zeros(size, MAT_TYPE);
+    Mat covxy = Mat::zeros(size, MAT_TYPE);
+    Mat cos_pc, sin_pc, mul_pc;
+
+    const double angle_const = M_PI / static_cast<double>(norient);
+
+    for (unsigned o = 0; o < norient; o++)
+    {
+        auto angl = static_cast<double>(o) * angle_const;
+        cos_pc = _pc[o] * cos(angl);
+        sin_pc = _pc[o] * sin(angl);
+        multiply(cos_pc, sin_pc, mul_pc);
+        add(covxy, mul_pc, covxy);
+        pow(cos_pc, 2, cos_pc);
+        add(covx2, cos_pc, covx2);
+        pow(sin_pc, 2, sin_pc);
+        add(covy2, sin_pc, covy2);
+    } // next orientation
+
+    //Edges calculations
+    covx2 *= 2.0 / static_cast<double>(norient);
+    covy2 *= 2.0 / static_cast<double>(norient);
+    covxy *= 4.0 / static_cast<double>(norient);
+    Mat sub;
+    subtract(covx2, covy2, sub);
+
+    Mat denom;
+    magnitude(sub, covxy, denom); // denom;
+    Mat sum;
+    add(covy2, covx2, sum);
+
+    Mat minMoment, maxMoment;
+    subtract(sum, denom, minMoment);//m = (covy2 + covx2 - denom) / 2;          % ... and minimum moment
+    add(sum, denom, maxMoment); //M = (covy2+covx2 + denom)/2;          % Maximum moment
+
+    maxMoment.convertTo(edges, CV_8U, 255);
+    minMoment.convertTo(corners, CV_8U, 255);
+}
+
+//Build up covariance data for every point
+void PhaseCongruency::feature(InputArray _src, cv::OutputArray _edges, cv::OutputArray _corners)
+{
+    std::vector<cv::Mat> pc;
+    calc(_src, pc);
+    feature(pc, _edges, _corners);
+}
